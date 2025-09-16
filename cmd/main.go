@@ -20,11 +20,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-type Config struct {
-	FilePath   string    `toml:"FilePath"`
-	Aws        AwsConfig `toml:"AWS"`
-	Included   string    `toml:"Included"`
+type RootConfig struct {
 	DateFormat string    `toml:"DateFormat"`
+	AWS        AwsConfig `toml:"AWS"`
+	Paths      map[string]PathConfig
+}
+
+type PathConfig struct {
+	FilePath        string `toml:"FilePath"`
+	Included        string `toml:"Included"`
+	BucketName      string `toml:"BUCKET_NAME"`
+	AccessKeyId     string `toml:"ACCESS_KEY_ID"`
+	SecretAccessKey string `toml:"SECRET_ACCESS_KEY"`
+	Region          string `toml:"REGION"`
 }
 
 type AwsConfig struct {
@@ -35,8 +43,7 @@ type AwsConfig struct {
 }
 
 var (
-	config Config
-	files  []string
+	config RootConfig
 )
 
 func init() {
@@ -58,60 +65,116 @@ func init() {
 		panic(err)
 	}
 
-	if _, err := toml.Decode(string(data), &config); err != nil {
+	// Decode into primitives to support arbitrary subsections
+	raw := map[string]toml.Primitive{}
+	md, err := toml.Decode(string(data), &raw)
+	if err != nil {
 		slog.Error("Failed to parse config", "err", err)
 		panic(err)
 	}
 
-	slog.Info("Config loaded",
-		"FilePath", config.FilePath,
-		"Region", config.Aws.Region,
-		"Included", config.Included,
-	)
+	config.Paths = make(map[string]PathConfig)
+	for k, prim := range raw {
+		switch k {
+		case "DateFormat":
+			if err := md.PrimitiveDecode(prim, &config.DateFormat); err != nil {
+				slog.Error("Failed to decode DateFormat", "err", err)
+			}
+		case "AWS":
+			if err := md.PrimitiveDecode(prim, &config.AWS); err != nil {
+				slog.Error("Failed to decode AWS block", "err", err)
+			}
+		default:
+			var pc PathConfig
+			if err := md.PrimitiveDecode(prim, &pc); err != nil {
+				slog.Warn("Skipping unrecognized or invalid section", "section", k, "err", err)
+				continue
+			}
+			config.Paths[k] = pc
+		}
+	}
+
+	pathNames := make([]string, 0, len(config.Paths))
+	for name := range config.Paths {
+		pathNames = append(pathNames, name)
+	}
+	slog.Info("Config loaded", "paths", strings.Join(pathNames, ", "), "dateFormat", config.DateFormat, "hasGlobalAWS", config.AWS.Region != "" || config.AWS.AccessKeyId != "" || config.AWS.SecretAccessKey != "" || config.AWS.BucketName != "")
 }
 func main() {
-	err := filepath.WalkDir(config.FilePath, walk)
-	if err != nil {
-		slog.Error("Failed to walk directory", "err", err)
+	if len(config.Paths) == 0 {
+		slog.Warn("No paths defined in config.toml")
 		return
 	}
-	if len(files) == 0 {
-		slog.Error("No files found. Check your config.toml")
-	}
+
 	dateName := time.Now().Local().Format(config.DateFormat)
-	zipName := dateName + ".zip"
-	if err := createZip(files, config.FilePath, zipName); err != nil {
-		slog.Error("Failed to create zip", "err", err)
-		os.Exit(1)
-	}
-	slog.Info("Config archive created", "path", zipName)
+	for name, path := range config.Paths {
+		slog.Info("Processing path", "name", name, "path", path.FilePath)
+		files, err := collectFiles(path.FilePath, path.Included)
+		if err != nil {
+			slog.Error("Failed to walk directory", "path", name, "err", err)
+			continue
+		}
+		if len(files) == 0 {
+			slog.Warn("No files matched include pattern", "path", name, "included", path.Included)
+			continue
+		}
 
-	if err := uploadToS3(zipName, config.Aws); err != nil {
-		slog.Error("Failed to upload to S3", "err", err)
-		os.Exit(1)
-	}
+		zipName := dateName + ".zip"
+		if err := createZip(files, path.FilePath, zipName); err != nil {
+			slog.Error("Failed to create zip", "path", name, "err", err)
+			continue
+		}
+		slog.Info("Config archive created", "path", name, "path", zipName)
 
-	slog.Info("Uploaded zip to S3", "bucket", config.Aws.BucketName, "key", zipName)
+		effectiveAWS := mergeAWS(config.AWS, path)
+		if err := uploadToS3(zipName, effectiveAWS); err != nil {
+			slog.Error("Failed to upload to S3. Deleting file", "path", name, "err", err)
+			_ = os.Remove(zipName)
+			continue
+		}
+		slog.Info("Uploaded zip to S3", "path", name, "bucket", effectiveAWS.BucketName, "key", zipName)
 
-	err = os.Remove(zipName)
-	if err != nil {
-		slog.Error("Failed to clean up zip", "err", err)
-		os.Exit(1)
+		if err := os.Remove(zipName); err != nil {
+			slog.Error("Failed to clean up zip", "path", name, "err", err)
+			continue
+		}
+		slog.Info("Cleaned up zip file", "path", name)
 	}
-	slog.Info("Cleaned up zip file")
 }
 
-func walk(s string, _ fs.DirEntry, err error) error {
-	matched, err := regexp.MatchString(config.Included, s)
-	if err != nil {
-		slog.Error("Error", "err", err)
-		return err
-	}
-	if matched {
-		files = append(files, s)
+func collectFiles(basePath, includePattern string) ([]string, error) {
+	files := []string{}
+	err := filepath.WalkDir(basePath, func(s string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		matched, err := regexp.MatchString(includePattern, s)
+		if err != nil {
+			return err
+		}
+		if matched {
+			files = append(files, s)
+		}
 		return nil
+	})
+	return files, err
+}
+
+func mergeAWS(global AwsConfig, path PathConfig) AwsConfig {
+	res := global
+	if path.BucketName != "" {
+		res.BucketName = path.BucketName
 	}
-	return nil
+	if path.AccessKeyId != "" {
+		res.AccessKeyId = path.AccessKeyId
+	}
+	if path.SecretAccessKey != "" {
+		res.SecretAccessKey = path.SecretAccessKey
+	}
+	if path.Region != "" {
+		res.Region = path.Region
+	}
+	return res
 }
 
 func uploadToS3(zipPath string, awsCfg AwsConfig) error {

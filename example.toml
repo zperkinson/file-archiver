@@ -1,8 +1,21 @@
-FilePath="/home/myuser/myFolder"
-Included="*.txt|*.cfg"
-DateFormat="2006-01-02"
+DateFormat = "2006-01-02"
 [AWS]
-BUCKET_NAME="my-archive-bucket"
-ACCESS_KEY_ID=""
-SECRET_ACCESS_KEY=""
-REGION="us-east-1"
+ACCESS_KEY_ID = ""
+SECRET_ACCESS_KEY = ""
+REGION = "us-east-1"
+
+[Dir1]
+FilePath="/home/myuser/myFolder"
+Included = "*.txt|*.cfg"
+BUCKET_NAME = "my-archive-bucket"
+ACCESS_KEY_ID = ""
+SECRET_ACCESS_KEY = ""
+REGION = ""
+
+[Dir2]
+FilePath = "/home/myuser/other"
+Included = "*.zip"
+BUCKET_NAME = "my-other-bucket"
+ACCESS_KEY_ID = "MyOtherId"
+SECRET_ACCESS_KEY = "MyOtherKey"
+REGION = ""
