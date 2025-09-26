@@ -261,15 +261,11 @@ func createZip(filePaths []string, baseDir, outPath string) error {
 			archiveName = archiveName[2:]
 		}
 
-		h, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
+		// Create a minimal header to avoid writing file info metadata (timestamps, permissions, etc.).
+		h := &zip.FileHeader{
+			Name:   archiveName,
+			Method: zip.Deflate,
 		}
-		h.Name = archiveName
-		if info.ModTime().IsZero() {
-			h.Modified = time.Now()
-		}
-		h.Method = zip.Deflate
 
 		w, err := zw.CreateHeader(h)
 		if err != nil {
