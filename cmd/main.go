@@ -3,6 +3,9 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -44,6 +47,7 @@ type AwsConfig struct {
 
 var (
 	config RootConfig
+	hashes map[string]string
 )
 
 func init() {
@@ -100,6 +104,20 @@ func init() {
 	}
 	slog.Info("Config loaded", "paths", strings.Join(pathNames, ", "), "dateFormat", config.DateFormat, "hasGlobalAWS", config.AWS.Region != "" || config.AWS.AccessKeyId != "" || config.AWS.SecretAccessKey != "" || config.AWS.BucketName != "")
 }
+func init() {
+	if _, err := os.Stat("hashes.json"); errors.Is(err, os.ErrNotExist) {
+		slog.Info("Hashes file not found, creating new one")
+		f, _ := os.Create("hashes.json")
+		if f != nil {
+			_, _ = f.WriteString("{}")
+			f.Close()
+		}
+	}
+	var data []byte
+	data, _ = os.ReadFile("hashes.json")
+	_ = json.Unmarshal(data, &hashes)
+
+}
 func main() {
 	if len(config.Paths) == 0 {
 		slog.Warn("No paths defined in config.toml")
@@ -126,6 +144,26 @@ func main() {
 		}
 		slog.Info("Config archive created", "path", name, "path", zipName)
 
+		newHash, err := sha256File(zipName)
+		if err != nil {
+			slog.Error("Failed to compute sha256 for zip", "path", name, "err", err)
+			_ = os.Remove(zipName)
+			continue
+		}
+
+		if data, err := os.ReadFile("hashes.json"); err == nil && len(data) > 0 {
+			_ = json.Unmarshal(data, &hashes)
+		}
+		if old, ok := hashes[name]; ok && strings.EqualFold(old, newHash) {
+			slog.Info("No changes detected; skipping upload and hash update", "key", name)
+			if err := os.Remove(zipName); err != nil {
+				slog.Error("Failed to clean up zip", "path", name, "err", err)
+			} else {
+				slog.Info("Cleaned up zip file", "path", name)
+			}
+			continue
+		}
+
 		effectiveAWS := mergeAWS(config.AWS, path)
 		if err := uploadToS3(zipName, effectiveAWS); err != nil {
 			slog.Error("Failed to upload to S3. Deleting file", "path", name, "err", err)
@@ -133,6 +171,12 @@ func main() {
 			continue
 		}
 		slog.Info("Uploaded zip to S3", "path", name, "bucket", effectiveAWS.BucketName, "key", zipName)
+
+		if err := upsertHashJSON(name, newHash); err != nil {
+			slog.Error("Failed to write hash to hashes.json", "path", name, "err", err)
+		} else {
+			slog.Info("Updated hashes.json", "key", name, "sha256", newHash)
+		}
 
 		if err := os.Remove(zipName); err != nil {
 			slog.Error("Failed to clean up zip", "path", name, "err", err)
@@ -143,7 +187,7 @@ func main() {
 }
 
 func collectFiles(basePath, includePattern string) ([]string, error) {
-	files := []string{}
+	var files []string
 	err := filepath.WalkDir(basePath, func(s string, _ fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -231,6 +275,38 @@ func ctxWithTimeout() context.Context {
 	return ctx
 }
 
+// sha256File computes the SHA-256 of the given file and returns it as lowercase hex string.
+func sha256File(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// upsertHashJSON updates hashes.json with the provided key (e.g., path name) mapped to the given hash.
+func upsertHashJSON(key, hash string) error {
+	// Load existing map (if any)
+	m := map[string]string{}
+	if data, err := os.ReadFile("hashes.json"); err == nil && len(data) > 0 {
+		_ = json.Unmarshal(data, &m)
+	}
+
+	m[key] = hash
+
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("hashes.json", b, 0644)
+}
+
 func createZip(filePaths []string, baseDir, outPath string) error {
 	f, err := os.Create(outPath)
 	if err != nil {
@@ -261,7 +337,6 @@ func createZip(filePaths []string, baseDir, outPath string) error {
 			archiveName = archiveName[2:]
 		}
 
-		// Create a minimal header to avoid writing file info metadata (timestamps, permissions, etc.).
 		h := &zip.FileHeader{
 			Name:   archiveName,
 			Method: zip.Deflate,

@@ -33,3 +33,4 @@ go.work.sum
 config.toml
 *.zip
 *.log
+hashes.json
